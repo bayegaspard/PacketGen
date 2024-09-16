@@ -10,27 +10,32 @@ from utils import (
     evaluate_classifier,
     compute_mmd,
     visualize_diffusion_process,
-    visualize_packet_changes
+    visualize_packet_changes,
+    save_adversarial_samples,
+    load_adversarial_samples,
+    load_model
 )
 from modules import UNet, Classifier
 import logging
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s",
-                    level=logging.INFO, datefmt="%I:%M:%S")
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s: %(message)s",
+    level=logging.INFO,
+    datefmt="%I:%M:%S"
+)
 
 
 class Diffusion:
-    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=16, device="cuda"):
+    def __init__(self, img_size, device, noise_steps=1000, beta_start=1e-4, beta_end=0.02):
+        self.img_size = img_size
+        self.device = device
         self.noise_steps = noise_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
-        self.img_size = img_size  # Represents the size of the reshaped data
-        self.device = device
-
         self.beta = self.prepare_noise_schedule().to(device)
-        self.alpha = 1. - self.beta
+        self.alpha = 1.0 - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 
     def prepare_noise_schedule(self):
@@ -39,73 +44,53 @@ class Diffusion:
     def noise_data(self, x, t):
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
-        epsilon = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
+        noise = torch.randn_like(x)
+        x_t = sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * noise
+        return x_t, noise
 
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
     def generate_adversarial(self, model, x, t):
         model.eval()
-        x = x.clone().detach().to(self.device)
-        t = t.to(self.device)
-        x.requires_grad = True
-
-        # Ensure model parameters are not updated
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # Enable gradient computation
-        with torch.enable_grad():
-            # Forward pass through the diffusion model
-            predicted_noise = model(x, t)
-            loss = -predicted_noise.mean()  # Maximize the noise to create adversarial effect
-            loss.backward()
-            perturbation = x.grad.sign() * 0.1  # Scaled perturbation
-            x_adv = x + perturbation
-            x_adv = torch.clamp(x_adv, -1, 1)  # Ensure data stays within valid range
-
-        model.train()
-        # Reset model parameters to require gradients for future training
-        for param in model.parameters():
-            param.requires_grad = True
-
-        return x_adv.detach()
-
-    def sample(self, model, n):
-        logging.info(f"Sampling {n} new data points....")
-        model.eval()
         with torch.no_grad():
-            x = torch.randn((n, 1, self.img_size, self.img_size)).to(self.device)
-            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
-                t = torch.full((n,), i, dtype=torch.long).to(self.device)
-                predicted_noise = model(x, t)
-                alpha = self.alpha[t][:, None, None, None]
-                alpha_hat = self.alpha_hat[t][:, None, None, None]
-                beta = self.beta[t][:, None, None, None]
-                if i > 1:
-                    noise = torch.randn_like(x)
-                else:
-                    noise = torch.zeros_like(x)
-                x = (1 / torch.sqrt(alpha)) * (
-                    x - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * predicted_noise
-                ) + torch.sqrt(beta) * noise
+            x_noisy, _ = self.noise_data(x, t)
+            predicted_noise = model(x_noisy, t)
+            alpha = self.alpha[t][:, None, None, None]
+            alpha_hat = self.alpha_hat[t][:, None, None, None]
+            x_adv = (1 / torch.sqrt(alpha)) * (
+                x_noisy - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * predicted_noise
+            )
         model.train()
-        # Reshape back to original feature dimensions
-        x = x.view(n, -1)
-        return x
+        return x_adv.squeeze()
 
 
-def train(args):
+def main(args):
     setup_logging(args.run_name)
     device = args.device
-    diffusion_dataloader, classifier_dataloader, data_dim, scaler, label_encoder = get_data(args)
-    img_size = int(np.ceil(np.sqrt(data_dim)))
+    (
+        diffusion_dataloader,
+        classifier_dataloader,
+        data_dim,
+        scaler,
+        label_encoder,
+        feature_names
+    ) = get_data(args)
+    img_size = 2 ** int(np.ceil(np.log2(np.sqrt(data_dim))))
     args.data_dim = data_dim  # Save data_dim in args for later use
 
     # Initialize models
     diffusion_model = UNet(c_in=1, c_out=1, img_size=img_size).to(device)
     classifier = Classifier(input_dim=data_dim, num_classes=len(label_encoder.classes_)).to(device)
+
+    # Load pre-trained models if specified
+    if args.load_classifier and os.path.exists(args.classifier_model_path):
+        classifier.load_state_dict(torch.load(args.classifier_model_path))
+        logging.info(f"Loaded pre-trained classifier model from {args.classifier_model_path}")
+
+    if args.load_diffusion and os.path.exists(args.diffusion_model_path):
+        diffusion_model.load_state_dict(torch.load(args.diffusion_model_path))
+        logging.info(f"Loaded pre-trained diffusion model from {args.diffusion_model_path}")
 
     # Optimizers and loss functions
     optimizer_diffusion = optim.AdamW(diffusion_model.parameters(), lr=args.lr)
@@ -114,93 +99,108 @@ def train(args):
     ce_loss = nn.CrossEntropyLoss()
     diffusion = Diffusion(img_size=img_size, device=device)
     logger = SummaryWriter(os.path.join("runs", args.run_name))
-    l = len(diffusion_dataloader)
 
-    # Train classifier on real data
-    logging.info("Training classifier on real data...")
+    # Perform the specified operation
+    if args.operation == 'train_classifier':
+        train_classifier(classifier, classifier_dataloader, optimizer_classifier, ce_loss, args, logger, device)
+    elif args.operation == 'train_diffusion':
+        train_diffusion(diffusion_model, diffusion_dataloader, optimizer_diffusion, mse_loss, diffusion, args, logger, device)
+    elif args.operation == 'generate_adversarial':
+        generate_and_save_adversarial_samples(diffusion_model, diffusion_dataloader, classifier, diffusion, scaler, label_encoder, feature_names, args, device)
+    elif args.operation == 'evaluate_classifier':
+        evaluate_saved_adversarial_samples(classifier, classifier_dataloader, label_encoder, args, device)
+
+
+def train_classifier(classifier, dataloader, optimizer, loss_fn, args, logger, device):
     classifier.train()
-    for epoch_cls in range(args.classifier_epochs):
+    logging.info("Training classifier...")
+    for epoch in range(args.classifier_epochs):
         total_loss = 0
-        pbar_cls = tqdm(classifier_dataloader, desc=f"Classifier Training Epoch {epoch_cls+1}/{args.classifier_epochs}")
-        for data, labels in pbar_cls:
+        pbar = tqdm(dataloader, desc=f"Classifier Training Epoch {epoch+1}/{args.classifier_epochs}")
+        for data, labels in pbar:
             data = data.to(device)
             labels = labels.to(device)
-            optimizer_classifier.zero_grad()
+            optimizer.zero_grad()
             outputs = classifier(data)
-            loss = ce_loss(outputs, labels)
+            loss = loss_fn(outputs, labels)
             loss.backward()
-            optimizer_classifier.step()
+            optimizer.step()
             total_loss += loss.item()
-            pbar_cls.set_postfix(Loss=loss.item())
-        avg_loss = total_loss / len(classifier_dataloader)
-        logging.info(f"Classifier Training Epoch {epoch_cls + 1}/{args.classifier_epochs}, Loss: {avg_loss:.4f}")
+            pbar.set_postfix(Loss=loss.item())
+        avg_loss = total_loss / len(dataloader)
+        logging.info(f"Epoch {epoch+1}/{args.classifier_epochs}, Loss: {avg_loss:.4f}")
+        torch.save(classifier.state_dict(), os.path.join("models", args.run_name, f"classifier_epoch_{epoch+1}.pt"))
 
-        # Save classifier model
-        torch.save(classifier.state_dict(), os.path.join("models", args.run_name, f"classifier_epoch_{epoch_cls}.pt"))
 
-    # Training diffusion model
+def train_diffusion(model, dataloader, optimizer, loss_fn, diffusion, args, logger, device):
+    model.train()
+    logging.info("Training diffusion model...")
     for epoch in range(args.epochs):
-        logging.info(f"Starting diffusion model training epoch {epoch+1}/{args.epochs}:")
-        pbar = tqdm(diffusion_dataloader)
-        diffusion_model.train()
-        for i, (data, labels) in enumerate(pbar):
+        pbar = tqdm(dataloader, desc=f"Diffusion Training Epoch {epoch+1}/{args.epochs}")
+        for i, (data, _) in enumerate(pbar):
             data = data.to(device)
             t = diffusion.sample_timesteps(data.shape[0]).to(device)
             x_t, noise = diffusion.noise_data(data, t)
-            predicted_noise = diffusion_model(x_t, t)
-            loss = mse_loss(noise, predicted_noise)
+            predicted_noise = model(x_t, t)
+            loss = loss_fn(noise, predicted_noise)
 
-            optimizer_diffusion.zero_grad()
+            optimizer.zero_grad()
             loss.backward()
-            optimizer_diffusion.step()
+            optimizer.step()
 
             pbar.set_postfix(MSE=loss.item())
-            logger.add_scalar("MSE", loss.item(), global_step=epoch * l + i)
+            logger.add_scalar("MSE", loss.item(), global_step=epoch * len(dataloader) + i)
+        torch.save(model.state_dict(), os.path.join("models", args.run_name, f"diffusion_epoch_{epoch+1}.pt"))
 
-        # Save diffusion model
-        torch.save(diffusion_model.state_dict(), os.path.join("models", args.run_name, f"diffusion_epoch_{epoch}.pt"))
 
-        # Sample new data points
-        sampled_data = diffusion.sample(diffusion_model, n=1000)
-        # Inverse transform the data back to original scale
-        sampled_data_np = scaler.inverse_transform(sampled_data.cpu().numpy()[:, :data_dim])
-        # Save the sampled data
-        np.savetxt(os.path.join("results", args.run_name, f"sampled_epoch_{epoch}.csv"), sampled_data_np, delimiter=",")
+def generate_and_save_adversarial_samples(model, dataloader, classifier, diffusion, scaler, label_encoder, feature_names, args, device):
+    # Load the diffusion model
+    model = load_model(model, args.diffusion_model_path, device)
+    model.eval()
+    classifier.eval()
+    logging.info("Generating adversarial examples...")
+    adversarial_examples = []
+    true_labels = []
 
-        # Generate adversarial examples
-        logging.info("Generating adversarial examples...")
-        adversarial_examples = []
-        true_labels = []
-        classifier.eval()
-        diffusion_model.eval()
+    for data, labels in tqdm(dataloader, desc="Generating Adversarial Samples"):
+        data = data.to(device)
+        labels = labels.to(device)
+        t = diffusion.sample_timesteps(data.shape[0]).to(device)
+        x_adv = diffusion.generate_adversarial(model, data, t)
+        adversarial_examples.append(x_adv)
+        true_labels.append(labels)
 
-        for data, labels in diffusion_dataloader:
-            data = data.to(device)
-            labels = labels.to(device)
-            t = diffusion.sample_timesteps(data.shape[0]).to(device)
-            x_adv = diffusion.generate_adversarial(diffusion_model, data, t)
-            adversarial_examples.append(x_adv)
-            true_labels.append(labels)
-        adversarial_examples = torch.cat(adversarial_examples)
-        true_labels = torch.cat(true_labels)
+    adversarial_examples = torch.cat(adversarial_examples)
+    true_labels = torch.cat(true_labels)
 
-        # Prepare adversarial examples for classifier
-        adversarial_examples = adversarial_examples.view(adversarial_examples.size(0), -1)
-        # Take only the first data_dim features (original features before padding)
-        adversarial_examples = adversarial_examples[:, :data_dim]
+    # Reshape adversarial examples to match classifier input
+    adversarial_examples = adversarial_examples.view(adversarial_examples.size(0), -1)
+    adversarial_examples = adversarial_examples[:, :args.data_dim]  # Crop or pad to match data_dim
 
-        # Evaluate classifier on normal and adversarial data
-        evaluate_classifier(classifier, classifier_dataloader, adversarial_examples, true_labels, epoch, args, label_encoder, device)
+    # Save adversarial samples
+    save_adversarial_samples(adversarial_examples, true_labels, args)
+    logging.info("Adversarial samples generated and saved successfully.")
 
-        # Plotting
-        plot_data(sampled_data_np, epoch, args)
-        visualize_packet_changes(classifier_dataloader, adversarial_examples, epoch, args)
 
-        # Compute MMD
-        compute_mmd(sampled_data_np, args)
+def evaluate_saved_adversarial_samples(classifier, classifier_dataloader, label_encoder, args, device):
+    # Load saved adversarial samples
+    adversarial_examples, true_labels = load_adversarial_samples(args)
+    adversarial_examples = adversarial_examples.to(device)
+    true_labels = true_labels.to(device)
 
-        # Visualize diffusion process
-        visualize_diffusion_process(diffusion_model, diffusion, (img_size, img_size), args)
+    # Evaluate classifier on normal and adversarial data
+    logging.info("Evaluating classifier on saved adversarial data...")
+    evaluate_classifier(
+        classifier,
+        classifier_dataloader,
+        adversarial_examples,
+        true_labels,
+        epoch=0,  # Assuming single epoch for evaluation
+        args=args,
+        label_encoder=label_encoder,
+        device=device,
+        feature_names=None  # Adjust based on your use case
+    )
 
 
 def launch():
@@ -213,8 +213,14 @@ def launch():
     parser.add_argument('--dataset_path', type=str, default="path_to_cic_dataset.csv")
     parser.add_argument('--device', type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--operation', type=str, choices=['train_classifier', 'train_diffusion', 'generate_adversarial', 'evaluate_classifier'], default='generate_adversarial', help='Operation to perform')
+    parser.add_argument('--classifier_model_path', type=str, default='models/DDPM_CIC/classifier.pt', help='Path to the classifier model')
+    parser.add_argument('--diffusion_model_path', type=str, default='models/DDPM_CIC/diffusion.pt', help='Path to the diffusion model')
+    parser.add_argument('--load_classifier', action='store_true', help='Flag to load a pre-trained classifier model')
+    parser.add_argument('--load_diffusion', action='store_true', help='Flag to load a pre-trained diffusion model')
+    parser.add_argument('--adversarial_samples_path', type=str, default='adversarial_samples.pt', help='Path to save/load adversarial samples')
     args = parser.parse_args()
-    train(args)
+    main(args)
 
 
 if __name__ == '__main__':
