@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import logging
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
@@ -15,6 +16,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 1. Load and Preprocess Your Dataset
 
 # Load your dataset
@@ -69,7 +73,6 @@ test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size)
-
 # 2. Build a Deep Learning Classification Model with PyTorch
 
 # Define the model
@@ -92,20 +95,14 @@ class Net(nn.Module):
 
 # Instantiate the model
 input_size = X_train.shape[1]
-model = Net(input_size, num_classes)
-
-# Move the model to GPU if available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"\nUsing device: {device}")
-model = model.to(device)
+model = Net(input_size, num_classes).to(device)
 
 # Define loss function and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
-
 # 3. Train the Model
 
-num_epochs = 20
+num_epochs = 5
 train_losses = []
 val_accuracies = []
 
@@ -141,7 +138,6 @@ for epoch in range(num_epochs):
     val_accuracies.append(val_accuracy)
     
     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
-
 # 4. Evaluate the Model on Test Data
 
 model.eval()
@@ -154,8 +150,7 @@ with torch.no_grad():
         y_pred.extend(predicted.cpu().numpy())
 
 print('\nClassification Report:')
-print(classification_report(y_test, y_pred, target_names=label_encoder.classes_))
-
+print(classification_report(y_test, y_pred, target_names=label_encoder.classes_, zero_division=1))
 # 5. Diffusion Model for Adversarial Example Generation
 
 class DiffusionModel(nn.Module):
@@ -167,6 +162,11 @@ class DiffusionModel(nn.Module):
         self.alpha = 1.0 - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 
+        # Neural network layers for the diffusion model
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(256, input_dim)
+
     def prepare_noise_schedule(self, beta_start, beta_end):
         return torch.linspace(beta_start, beta_end, self.noise_steps)
 
@@ -176,6 +176,13 @@ class DiffusionModel(nn.Module):
         noise = torch.randn_like(x)
         x_t = sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * noise
         return x_t, noise
+
+    def forward(self, x, t):
+        # Forward pass through the diffusion model's neural network
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
 
     def generate_adversarial(self, model, x, t):
         model.eval()
@@ -189,6 +196,11 @@ class DiffusionModel(nn.Module):
             )
         model.train()
         return x_adv
+# Save the trained diffusion model
+def save_diffusion_model(model, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model.state_dict(), path)
+    logging.info(f"Diffusion model saved to {path}")
 
 # Load a pre-trained diffusion model if available
 def load_diffusion_model(path, input_dim):
@@ -197,13 +209,17 @@ def load_diffusion_model(path, input_dim):
         model.load_state_dict(torch.load(path, map_location=device))
         logging.info(f"Loaded diffusion model from {path}")
     else:
-        logging.warning(f"Diffusion model path {path} does not exist.")
+        logging.warning(f"Diffusion model path {path} does not exist. Please train the model first.")
     return model
 
-# 6. Generate Adversarial Examples Using the Diffusion Model
-
-diffusion_model_path = 'models/diffusion_model.pt'  # Adjust as needed
+# Load or train the diffusion model
+diffusion_model_path = 'models/diffusion_model.pt'
 diffusion_model = load_diffusion_model(diffusion_model_path, input_size).to(device)
+if not os.path.exists(diffusion_model_path):
+    # Train the model if it does not exist
+    # Define your training loop for the diffusion model here
+    save_diffusion_model(diffusion_model, diffusion_model_path)
+# 6. Generate Adversarial Examples Using the Diffusion Model
 
 adversarial_examples = []
 true_labels = []
@@ -222,7 +238,6 @@ true_labels = torch.cat(true_labels)
 
 # Save adversarial samples for future evaluation
 torch.save({'adversarial_examples': adversarial_examples, 'true_labels': true_labels}, 'adversarial_samples.pt')
-
 # 7. Evaluate the Model on Adversarial Examples
 
 adv_dataset = TensorDataset(adversarial_examples, y_test_tensor)
@@ -238,7 +253,7 @@ with torch.no_grad():
         y_adv_pred.extend(predicted_adv.cpu().numpy())
 
 print('\nAdversarial Classification Report:')
-print(classification_report(y_test, y_adv_pred, target_names=label_encoder.classes_))
+print(classification_report(y_test, y_adv_pred, target_names=label_encoder.classes_, zero_division=1))
 
 # Calculate Accuracy Drop
 original_accuracy = val_accuracies[-1]
@@ -246,7 +261,6 @@ adv_correct = sum(np.array(y_adv_pred) == y_test)
 adv_accuracy = adv_correct / len(y_test)
 accuracy_drop = original_accuracy - adv_accuracy
 print(f'Accuracy Drop due to Adversarial Attack: {accuracy_drop:.4f}')
-
 # 8. Visualize the Results
 
 # Plot Training Loss
