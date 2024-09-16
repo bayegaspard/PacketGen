@@ -3,3 +3,6 @@ torchvision
 pandas
 scikit-learn
 tensorboard
+matplotlib
+numpy
+tqdm
