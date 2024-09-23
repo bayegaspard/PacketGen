@@ -1,2 +1,2 @@
-# Adversarial Robustness of OSR-enabled DNN
-Adversarial Robustness of DNN
+# PacketGen: Adversarial Robustness evaluation toolkit for DNN
+PacketGen: Adversarial Robustness evaluation toolkit for DNN
